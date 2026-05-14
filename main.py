@@ -3,9 +3,10 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from sqlalchemy import create_engine, Column, Integer, String, Float, Date, Boolean, desc, text
 from sqlalchemy.orm import sessionmaker, Session, declarative_base
 import requests
+import cloudscraper
 from bs4 import BeautifulSoup
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 import uvicorn
 import os
 import json
@@ -65,145 +66,129 @@ def get_db():
 
 BASE_URL = "https://www.marketindex.com.au"
 CATEGORY_URL = f"{BASE_URL}/news/category/technical-analysis"
-RSS_URLS = [
-    f"{BASE_URL}/rss",
-    f"{BASE_URL}/feed",
-    f"{BASE_URL}/news/feed",
-    f"{BASE_URL}/rss.xml",
-]
-
-# Full browser-like headers — many sites 403 on minimal UA strings
-_BROWSER_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-AU,en-GB;q=0.9,en;q=0.8",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-    "Cache-Control": "max-age=0",
-    "DNT": "1",
-}
+SLUG_PATTERN = "chartwatch-asx-scans"
 
 
-def _make_session() -> requests.Session:
-    """
-    Return a requests.Session that looks like a real browser.
-    Hits the homepage first so we pick up any session cookies /
-    anti-bot tokens before requesting deep pages.
-    """
-    s = requests.Session()
-    s.headers.update(_BROWSER_HEADERS)
+def _make_scraper():
+    """Return a cloudscraper session (bypasses Cloudflare JS challenges)."""
     try:
-        # Warm up: visit homepage to collect cookies (Cloudflare, etc.)
-        s.get(BASE_URL, timeout=20, allow_redirects=True)
-    except requests.RequestException:
-        pass  # best-effort; carry on
-    return s
+        return cloudscraper.create_scraper(
+            browser={"browser": "chrome", "platform": "windows", "mobile": False}
+        )
+    except Exception:
+        s = requests.Session()
+        s.headers["User-Agent"] = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        )
+        return s
+
+
+def _fetch(url: str, scraper=None) -> tuple[str | None, int]:
+    """Fetch a URL; returns (html, status_code). On failure returns (None, code)."""
+    s = scraper or _make_scraper()
+    try:
+        r = s.get(url, timeout=30, allow_redirects=True)
+        return (r.text if r.status_code == 200 else None), r.status_code
+    except Exception:
+        return None, 0
 
 
 def _find_chartwatch_in_html(html: str) -> str | None:
     """Return first ChartWatch article URL found in an HTML page."""
     soup = BeautifulSoup(html, "html.parser")
-
-    # 1. Any <a href> that contains 'chartwatch'
+    # href match
     for a in soup.find_all("a", href=True):
         href = a["href"]
-        if "chartwatch" in href.lower():
+        if SLUG_PATTERN in href.lower():
             return href if href.startswith("http") else BASE_URL + href
-
-    # 2. Heading/link whose text contains 'ChartWatch'
+    # visible text match
     for tag in soup.find_all(["h2", "h3", "h4", "a"]):
         if "chartwatch" in tag.get_text(strip=True).lower():
             a = tag if tag.name == "a" else tag.find_parent("a") or tag.find("a")
             if a and a.get("href"):
                 href = a["href"]
                 return href if href.startswith("http") else BASE_URL + href
-
-    # 3. JSON-LD structured data
+    # JSON-LD
     for script in soup.find_all("script", type="application/ld+json"):
         try:
             data = json.loads(script.string or "")
             for item in (data if isinstance(data, list) else [data]):
-                url = item.get("url", "")
-                if "chartwatch" in url.lower():
-                    return url
+                u = item.get("url", "")
+                if SLUG_PATTERN in u.lower():
+                    return u
         except (json.JSONDecodeError, AttributeError):
             continue
-
     return None
 
 
-def _find_chartwatch_in_rss(xml: str) -> str | None:
-    """Return first ChartWatch article URL found in an RSS/Atom feed."""
-    soup = BeautifulSoup(xml, "xml")  # lxml XML parser
-    for item in soup.find_all(["item", "entry"]):
-        title_tag = item.find(["title"])
-        link_tag  = item.find(["link", "id"])
-        if title_tag and "chartwatch" in title_tag.get_text(strip=True).lower():
-            if link_tag:
-                href = link_tag.get("href") or link_tag.get_text(strip=True)
-                if href:
-                    return href if href.startswith("http") else BASE_URL + href
+def _guess_direct_urls() -> list[str]:
+    """
+    ChartWatch articles follow the slug pattern:
+      /news/chartwatch-asx-scans-{day}-{month}-{year}
+    e.g. /news/chartwatch-asx-scans-12-may-2025
+    Try today and the previous 14 days to cover the weekly cadence.
+    """
+    today = date.today()
+    return [
+        f"{BASE_URL}/news/{SLUG_PATTERN}-{(today - timedelta(days=d)).day}"
+        f"-{(today - timedelta(days=d)).strftime('%B').lower()}"
+        f"-{(today - timedelta(days=d)).year}"
+        for d in range(14)
+    ]
+
+
+def _ddg_search(scraper) -> str | None:
+    """DuckDuckGo Lite HTML search — no API key, rarely rate-limited."""
+    try:
+        query = f"site:marketindex.com.au {SLUG_PATTERN}"
+        url = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}"
+        html, _ = _fetch(url, scraper)
+        if not html:
+            return None
+        soup = BeautifulSoup(html, "html.parser")
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            # DuckDuckGo wraps links as uddg= query params
+            m = re.search(r"uddg=(https?[^&]+)", href)
+            clean = requests.utils.unquote(m.group(1)) if m else href
+            if "marketindex.com.au" in clean and SLUG_PATTERN in clean.lower():
+                return clean
+    except Exception:
+        pass
     return None
 
 
 def get_latest_chartwatch_url() -> tuple[str | None, str]:
     """
-    Try multiple strategies to find the latest ChartWatch ASX Scans article.
+    Multi-strategy discovery of the latest ChartWatch ASX Scans article.
     Returns (url, error_message).
     """
-    session = _make_session()
+    scraper = _make_scraper()
     errors: list[str] = []
 
-    # ── Strategy 1: category page (with warmed-up session) ──────────────────
-    try:
-        resp = session.get(CATEGORY_URL, timeout=30)
-        resp.raise_for_status()
-        url = _find_chartwatch_in_html(resp.text)
+    # ── Strategy 1: Guess URL directly from date slug ────────────────────────
+    for candidate in _guess_direct_urls():
+        html, status = _fetch(candidate, scraper)
+        if html and len(html) > 5000:   # real article page, not a redirect/404
+            return candidate, ""
+    errors.append("Direct URL guessing: no match in last 14 days.")
+
+    # ── Strategy 2: Category page via cloudscraper ───────────────────────────
+    html, status = _fetch(CATEGORY_URL, scraper)
+    if html:
+        url = _find_chartwatch_in_html(html)
         if url:
             return url, ""
-        errors.append("Category page loaded but no ChartWatch link found.")
-    except requests.HTTPError as e:
-        errors.append(f"Category page HTTP {e.response.status_code}: blocked or unavailable.")
-    except requests.RequestException as e:
-        errors.append(f"Category page request failed: {e}")
+        errors.append(f"Category page loaded (HTTP {status}) but no link found.")
+    else:
+        errors.append(f"Category page blocked (HTTP {status}).")
 
-    # ── Strategy 2: RSS / Atom feeds ────────────────────────────────────────
-    for rss_url in RSS_URLS:
-        try:
-            resp = session.get(rss_url, timeout=20)
-            if resp.status_code == 200 and ("<rss" in resp.text or "<feed" in resp.text):
-                url = _find_chartwatch_in_rss(resp.text)
-                if url:
-                    return url, ""
-        except requests.RequestException:
-            pass
-    errors.append("No ChartWatch link found in any RSS feed.")
-
-    # ── Strategy 3: Google site-search (public, no auth needed) ─────────────
-    try:
-        query = "site:marketindex.com.au chartwatch asx scans"
-        g_url = f"https://www.google.com/search?q={requests.utils.quote(query)}&num=5"
-        gresp = session.get(g_url, timeout=20)
-        soup  = BeautifulSoup(gresp.text, "html.parser")
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            # Google wraps results in /url?q=...
-            if "marketindex.com.au" in href and "chartwatch" in href.lower():
-                # Strip Google redirect wrapper if present
-                m = re.search(r"https?://www\.marketindex\.com\.au[^\s&\"'>]+", href)
-                if m:
-                    return m.group(0), ""
-    except requests.RequestException as e:
-        errors.append(f"Google fallback failed: {e}")
+    # ── Strategy 3: DuckDuckGo HTML search ──────────────────────────────────
+    url = _ddg_search(scraper)
+    if url:
+        return url, ""
+    errors.append("DuckDuckGo search returned no results.")
 
     return None, " | ".join(errors)
 
@@ -227,15 +212,13 @@ def parse_chartwatch_page(url: str) -> tuple[list[dict], str]:
 
     Each record is a dict with keys matching ScanEntry columns.
     """
-    session = _make_session()
-    session.headers["Referer"] = CATEGORY_URL  # look like we clicked from the listing
-    try:
-        resp = session.get(url, timeout=30)
-        resp.raise_for_status()
-    except requests.RequestException as e:
-        return [], f"Failed to load article: {e}"
+    scraper = _make_scraper()
+    scraper.headers["Referer"] = CATEGORY_URL
+    html, status = _fetch(url, scraper)
+    if not html:
+        return [], f"Failed to load article (HTTP {status}): site blocked request or article not found."
 
-    soup = BeautifulSoup(resp.text, "html.parser")
+    soup = BeautifulSoup(html, "html.parser")
 
     # --- Attempt 1: HTML <table> extraction ---
     records = _parse_tables(soup, url)
@@ -523,9 +506,9 @@ def debug_fetch(url: str = Query(default=CATEGORY_URL)):
     Fetch any URL with the scraper session and return status, headers,
     and the first 3000 chars of body. Useful for diagnosing 403s.
     """
-    session = _make_session()
+    scraper = _make_scraper()
     try:
-        resp = session.get(url, timeout=20)
+        resp = scraper.get(url, timeout=20)
         return {
             "url": url,
             "status_code": resp.status_code,
