@@ -1,7 +1,0 @@
-fastapi
-uvicorn[standard]
-sqlalchemy
-pydantic
-requests
-beautifulsoup4
-python-dotenv
