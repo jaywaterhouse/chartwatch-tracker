@@ -45,15 +45,39 @@ def get_db():
 # ====================== SCRAPER ======================
 def get_latest_chartwatch_url():
     try:
-        resp = requests.get("https://www.marketindex.com.au/news/category/technical-analysis", 
-                          headers={"User-Agent": "ChartWatchTracker/1.0"}, timeout=15)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0 Safari/537.36"
+        }
+        resp = requests.get(
+            "https://www.marketindex.com.au/news/category/technical-analysis", 
+            headers=headers, 
+            timeout=20
+        )
+        resp.raise_for_status()
+        
         soup = BeautifulSoup(resp.text, 'html.parser')
-        for a in soup.find_all('a', href=True):
-            if 'chartwatch-asx-scans' in a['href'].lower():
-                return "https://www.marketindex.com.au" + a['href']
+        
+        # More robust search for ChartWatch articles
+        links = soup.find_all('a', href=True)
+        chartwatch_links = []
+        
+        for a in links:
+            href = a['href'].lower()
+            if 'chartwatch-asx-scans' in href:
+                full_url = "https://www.marketindex.com.au" + href if href.startswith('/') else href
+                chartwatch_links.append(full_url)
+        
+        if chartwatch_links:
+            # Return the first (most recent) one
+            print(f"Found ChartWatch article: {chartwatch_links[0]}")
+            return chartwatch_links[0]
+            
+        print("No ChartWatch links found on page")
+        return None
+        
     except Exception as e:
-        print("URL fetch error:", e)
-    return None
+        print(f"Error fetching news page: {e}")
+        return None
 
 def parse_chartwatch_page(url):
     try:
