@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ChartWatch ASX Tracker</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-white">
+  <div class="max-w-6xl mx-auto p-8">
+    <h1 class="text-5xl font-bold text-center mb-4">📈 ChartWatch ASX Tracker</h1>
+    <p class="text-center text-gray-400 mb-10">Daily Excess Demand & Supply Scanner</p>
+    
+    <div class="flex gap-4 justify-center mb-10">
+      <button onclick="runScrape()" 
+              class="bg-emerald-600 hover:bg-emerald-700 px-8 py-4 rounded-xl text-lg font-semibold transition">
+        🚀 Run Today's Scan
+      </button>
+      <a href="/docs" target="_blank"
+         class="bg-zinc-800 hover:bg-zinc-700 px-8 py-4 rounded-xl text-lg font-semibold transition">
+        View API Docs
+      </a>
+    </div>
+
+    <div id="status" class="min-h-[100px] text-center"></div>
+  </div>
+
+  <script>
+    async function runScrape() {
+      const status = document.getElementById('status');
+      status.innerHTML = '<p class="text-yellow-400">Running scrape...</p>';
+      
+      try {
+        const res = await fetch('/run-scrape', { method: 'POST' });
+        const data = await res.json();
+        status.innerHTML = `<pre class="bg-zinc-900 p-6 rounded-2xl text-left text-sm overflow-auto max-h-96">${JSON.stringify(data, null, 2)}</pre>`;
+      } catch (e) {
+        status.innerHTML = `<p class="text-red-400">Error: ${e.message}</p>`;
+      }
+    }
+  </script>
+</body>
+</html>
