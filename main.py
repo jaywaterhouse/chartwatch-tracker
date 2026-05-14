@@ -9,7 +9,6 @@ from datetime import date
 import uvicorn
 import os
 
-# ====================== CONFIG ======================
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./chartwatch.db")
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -39,90 +38,44 @@ def get_db():
     finally:
         db.close()
 
-# ====================== IMPROVED SCRAPER ======================
+# ====================== DEBUG SCRAPER ======================
 def get_latest_chartwatch_url():
     try:
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
         resp = requests.get("https://www.marketindex.com.au/news/category/technical-analysis", 
-                           headers=headers, timeout=20)
+                           headers=headers, timeout=30)
+        print(f"News page status: {resp.status_code}")
+        
         soup = BeautifulSoup(resp.text, 'html.parser')
+        links_found = 0
         
         for a in soup.find_all('a', href=True):
             href = a['href'].lower()
             if 'chartwatch-asx-scans' in href:
+                links_found += 1
                 full_url = "https://www.marketindex.com.au" + href if href.startswith('/') else href
-                print(f"✅ Found article: {full_url}")
-                return full_url
-        print("❌ No ChartWatch link found")
+                print(f"Found ChartWatch link #{links_found}: {full_url}")
+                return full_url  # Return the first (newest) one
+        
+        print(f"Total ChartWatch links found: {links_found}")
         return None
     except Exception as e:
-        print(f"Error getting news page: {e}")
+        print(f"Error fetching news page: {e}")
         return None
-
 
 def parse_chartwatch_page(url: str):
     try:
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        resp = requests.get(url, headers=headers, timeout=20)
+        resp = requests.get(url, headers=headers, timeout=30)
         soup = BeautifulSoup(resp.text, 'html.parser')
         text = soup.get_text()
-
-        entries = []
-        scan_date = date.today()
-
-        # Parse tables
-        for table in soup.find_all('table'):
-            rows = table.find_all('tr')
-            if len(rows) < 2: continue
-            
-            trend_type = "up" if "Uptrends" in table.get_text() else "down"
-            
-            for row in rows[1:]:
-                cols = [td.get_text(strip=True) for td in row.find_all('td')]
-                if len(cols) < 4: continue
-                try:
-                    company = cols[0]
-                    code = cols[1].upper().strip()
-                    if len(code) > 6 or not code.isalnum(): continue
-                    
-                    price = float(re.sub(r'[^\d.]', '', cols[2]))
-                    mo = float(re.sub(r'[^\d.-]', '', cols[3]))
-                    yr = float(re.sub(r'[^\d.-]', '', cols[4])) if len(cols) > 4 else 0.0
-
-                    entries.append({
-                        "scan_date": scan_date,
-                        "company": company,
-                        "code": code,
-                        "last_price": price,
-                        "mo_change": mo,
-                        "yr_change": yr,
-                        "trend_type": trend_type,
-                        "is_strong_demand": False,
-                        "is_strong_supply": False
-                    })
-                except:
-                    continue
-
-        # Strongest Demand / Supply
-        demand_match = re.search(r'strongest excess demand.*?:(.+?)(?=####|The stocks|Downtrends)', text, re.I | re.S)
-        supply_match = re.search(r'strongest excess supply.*?:(.+?)(?=####|The stocks|Uptrends)', text, re.I | re.S)
-
-        demand_codes = re.findall(r'\(([A-Z0-9]{2,5})\)', demand_match.group(1) if demand_match else "")
-        supply_codes = re.findall(r'\(([A-Z0-9]{2,5})\)', supply_match.group(1) if supply_match else "")
-
-        for e in entries:
-            if e["code"] in demand_codes:
-                e["is_strong_demand"] = True
-            if e["code"] in supply_codes:
-                e["is_strong_supply"] = True
-
-        print(f"✅ Parsed {len(entries)} stocks")
-        return entries
+        
+        print(f"Successfully loaded article: {url}")
+        return [{"status": "parsed", "records": 0, "url": url}]  # Temporary for testing
     except Exception as e:
         print(f"Parse error: {e}")
         return []
 
-# ====================== ROUTES ======================
 @app.get("/", response_class=HTMLResponse)
 def home():
     return """
@@ -131,22 +84,18 @@ def home():
     <script src="https://cdn.tailwindcss.com"></script>
     </head>
     <body class="bg-gray-900 text-white p-8">
-        <div class="max-w-5xl mx-auto">
-            <h1 class="text-4xl font-bold mb-2">📊 ChartWatch ASX Tracker</h1>
-            <p class="text-gray-400 mb-8">Daily Strongest Excess Demand & Supply</p>
-            
-            <button onclick="runScan()" 
-                    class="bg-green-600 hover:bg-green-700 px-8 py-4 rounded-2xl text-xl font-semibold mb-8">
-                Run Today's Scan
+        <div class="max-w-4xl mx-auto">
+            <h1 class="text-4xl font-bold mb-8">📊 ChartWatch ASX Tracker</h1>
+            <button onclick="runScan()" class="bg-green-600 hover:bg-green-700 px-8 py-4 rounded-2xl text-xl font-semibold">
+                Run Today's Scan (Debug Mode)
             </button>
-            
-            <div id="result" class="text-sm"></div>
+            <div id="result" class="mt-8 text-sm font-mono"></div>
         </div>
         <script>
             async function runScan() {
                 const res = await fetch('/run-scrape', {method: 'POST'});
                 const data = await res.json();
-                document.getElementById('result').innerHTML = `<pre class="bg-gray-800 p-6 rounded-xl">${JSON.stringify(data, null, 2)}</pre>`;
+                document.getElementById('result').innerHTML = `<pre>${JSON.stringify(data, null, 2)}</pre>`;
             }
         </script>
     </body>
@@ -155,24 +104,16 @@ def home():
 
 @app.post("/run-scrape")
 def run_scrape(db: Session = Depends(get_db)):
+    print("=== Starting scan ===")
     url = get_latest_chartwatch_url()
     if not url:
-        return {"status": "error", "message": "Could not find latest ChartWatch article. Try again later."}
+        return {"status": "error", "message": "Could not find latest ChartWatch article. Check server logs."}
     
     data = parse_chartwatch_page(url)
-    if not data:
-        return {"status": "error", "message": "Failed to parse the article."}
-
-    # Simple save
-    for item in data:
-        entry = ScanEntry(**item)
-        db.add(entry)
-    db.commit()
-
     return {
         "status": "success", 
-        "records": len(data),
-        "message": f"Successfully saved {len(data)} stocks"
+        "message": "Found and loaded the latest article!",
+        "url": url
     }
 
 if __name__ == "__main__":
